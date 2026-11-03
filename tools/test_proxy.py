@@ -488,6 +488,32 @@ async def test_resync_replay_not_rebroadcast(env: Env):
     a.close()
 
 
+async def test_reconnect_backs_off(env: Env):
+    """Somebody using the node directly is kicked out less and less often."""
+    times = env.radio.connect_times
+
+    async def take_over():
+        # The newest connection wins, so this kicks the proxy out.
+        _, w = await asyncio.open_connection("127.0.0.1", env.radio.port)
+        return w
+
+    async def proxy_back(count, timeout):
+        for _ in range(int(timeout / 0.1)):
+            if len(times) >= count:
+                return
+            await asyncio.sleep(0.1)
+        raise TimeoutError("proxy did not reconnect")
+
+    delays = []
+    for _ in range(2):
+        await take_over()
+        kicked = len(times)
+        await proxy_back(kicked + 1, 20)
+        delays.append(times[kicked] - times[kicked - 1])
+    assert 4 <= delays[0] < 8, delays
+    assert 9 <= delays[1] < 13, delays
+
+
 TESTS = [
     test_config_served_from_cache,
     test_special_nonces,
@@ -506,6 +532,7 @@ TESTS = [
     test_history_does_not_rewind_nodes,
     test_history_follows_live_traffic,
     test_resync_replay_not_rebroadcast,
+    test_reconnect_backs_off,
 ]
 
 

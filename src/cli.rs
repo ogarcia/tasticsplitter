@@ -74,6 +74,16 @@ pub struct Cli {
     #[arg(long, default_value_t = 60, env = "TASTICSPLITTER_RESYNC_MINUTES")]
     pub resync_minutes: u32,
 
+    /// Longest wait, in seconds, between attempts to reconnect to the radio.
+    /// Retries start at 5 s and double while the radio keeps dropping us,
+    /// which leaves the node to anyone connected to it directly
+    #[arg(
+        long,
+        default_value_t = 300,
+        env = "TASTICSPLITTER_RECONNECT_MAX_SECONDS"
+    )]
+    pub reconnect_max_seconds: u64,
+
     /// Days to keep stored messages (0 = forever)
     #[arg(
         long,
@@ -116,6 +126,7 @@ impl Cli {
                 clients_days: self.clients_retention_days,
             },
             resync_minutes: self.resync_minutes,
+            reconnect_max: std::time::Duration::from_secs(self.reconnect_max_seconds),
         })
     }
 }

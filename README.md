@@ -124,9 +124,23 @@ Clients then connect to the proxy as they would to a network node, e.g.
 | `TASTICSPLITTER_DATA_DIR` | Data directory (default: ./data) |
 | `TASTICSPLITTER_LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
 | `TASTICSPLITTER_LOG_JSON` | Enable JSON event logging |
+| `TASTICSPLITTER_RECONNECT_MAX_SECONDS` | Longest wait between radio reconnection attempts (default: 300) |
 | `TASTICSPLITTER_RESYNC_MINUTES` | Minutes between full re-reads of the radio's config, 0 = only when it changes (default: 60) |
 | `TASTICSPLITTER_MESSAGES_RETENTION_DAYS` | Days to keep stored messages, 0 = forever (default: 0) |
 | `TASTICSPLITTER_CLIENTS_RETENTION_DAYS` | Days a client may stay away before it is forgotten, 0 = never (default: 180) |
+
+### Sharing the node with direct clients
+
+The node's TCP API serves only one client: a new connection closes the
+previous one. If somebody connects to the node directly (e.g. the
+official app over WiFi) the proxy loses the radio, closes its clients
+and reconnects — which in turn kicks that client out. To leave the node to
+whoever is using it, reconnection backs off: 5 s, 10, 20, 40... up to
+`TASTICSPLITTER_RECONNECT_MAX_SECONDS`, and only goes back to 5 s after a
+session that stayed up for a minute. A node reboot is still recovered in
+seconds. There is no way to check whether the node is busy without
+taking it over, so the proxy can't simply wait for the direct client to
+leave.
 
 ### Database maintenance
 
@@ -216,6 +230,7 @@ Each test gets a fresh fake radio and proxy on ephemeral ports.
 | `history_after_handshake` | The packet history follows a full `want_config`, oldest first, and not the split ones |
 | `history_does_not_rewind_nodes` | A day-old history packet doesn't turn back a node's last heard |
 | `history_follows_live_traffic` | Newer telemetry replaces the old one in the history; other metrics stay |
+| `reconnect_backs_off` | A client that takes the node over is kicked out after 5 s, then 10 s |
 | `resync_replay_not_rebroadcast` | The radio's history replay after a re-read doesn't reach connected clients |
 
 The fake radio also runs standalone:

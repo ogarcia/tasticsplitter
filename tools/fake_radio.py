@@ -77,6 +77,8 @@ class FakeRadio:
         self.want_configs: list[int] = []
         self.received: list[mesh_pb2.ToRadio] = []
         self.connections = 0
+        # Monotonic time of every accepted connection.
+        self.connect_times: list[float] = []
         self.next_from_id = 1
         # Last packet per (node, port, telemetry kind), replayed after every
         # full want_config like firmware 2.8 does. Seeded with old traffic.
@@ -119,6 +121,7 @@ class FakeRadio:
             self.writer.close()
         self.writer = writer
         self.connections += 1
+        self.connect_times.append(asyncio.get_running_loop().time())
         frames = FrameReader(reader)
         try:
             while True:

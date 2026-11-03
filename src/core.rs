@@ -17,9 +17,15 @@ use crate::store::{NewMessage, Retention, Store};
 const NONCE_ONLY_CONFIG: u32 = 69420;
 const NONCE_ONLY_NODES: u32 = 69421;
 
-const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// First delay before reconnecting to the radio; see `Backoff`.
+const RECONNECT_MIN: Duration = Duration::from_secs(5);
+/// A session that stayed up this long resets the reconnection backoff.
+const STABLE_SESSION: Duration = Duration::from_secs(60);
 /// A want_config stream that takes longer than this is considered lost.
-const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+/// A healthy node answers in under a second, but a struggling one has been
+/// seen to take a full minute: giving up just before it answers would only
+/// start the wait over.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 /// The official clients send one every five minutes; on serial the
 /// firmware drops the API session when it hears nothing for a while.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
@@ -48,6 +54,8 @@ pub struct CoreConfig {
     /// Re-read the radio's config and node database this often (0 = only
     /// when something changes it).
     pub resync_minutes: u32,
+    /// Ceiling of the reconnection backoff.
+    pub reconnect_max: Duration,
 }
 
 /// A client connection. It only gets traffic once it has finished its
@@ -297,6 +305,36 @@ enum SessionEnd {
     Shutdown,
 }
 
+/// Delay before the next connection to the radio. It doubles on every
+/// failure up to `max`, and only goes back to the minimum after a session
+/// that stayed up. The firmware serves only the newest TCP connection, so
+/// when somebody connects to the node directly, quick retries would kick
+/// them out every few seconds; backing off leaves them the node for longer
+/// and longer, while a reboot of the node is still recovered in seconds.
+struct Backoff {
+    next: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    fn new(max: Duration) -> Self {
+        Self {
+            next: RECONNECT_MIN.min(max),
+            max,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = (self.next * 2).min(self.max);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.next = RECONNECT_MIN.min(self.max);
+    }
+}
+
 pub struct Core {
     config: CoreConfig,
     store: Arc<Store>,
@@ -309,6 +347,8 @@ pub struct Core {
     history: History,
     sync: Option<Sync>,
     resync_at: Option<Instant>,
+    /// When the current radio session got its configuration.
+    up_since: Option<Instant>,
 }
 
 impl Core {
@@ -347,16 +387,23 @@ impl Core {
             history: History::default(),
             sync: None,
             resync_at: None,
+            up_since: None,
         })
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        let mut backoff = Backoff::new(self.config.reconnect_max);
         loop {
             let io = match self.connect_radio().await {
                 Ok(io) => io,
                 Err(e) => {
-                    tracing::warn!(error = %e, "radio connection failed, retrying");
-                    if self.wait(RECONNECT_DELAY).await {
+                    let delay = backoff.next_delay();
+                    tracing::warn!(
+                        error = %e,
+                        retry_in = format_args!("{}s", delay.as_secs()),
+                        "radio connection failed"
+                    );
+                    if self.wait(delay).await {
                         return Ok(());
                     }
                     continue;
@@ -365,6 +412,7 @@ impl Core {
             tracing::info!("radio connected");
 
             let end = self.session(io).await;
+            let up_for = self.up_since.take().map(|t| t.elapsed());
 
             // The frontend closes every client when the radio goes down;
             // forget what was in flight with this radio.
@@ -378,8 +426,23 @@ impl Core {
             match end {
                 SessionEnd::Shutdown => return Ok(()),
                 SessionEnd::RadioLost => {
-                    tracing::warn!("radio lost, reconnecting");
-                    if self.wait(RECONNECT_DELAY).await {
+                    if up_for.is_some_and(|d| d >= STABLE_SESSION) {
+                        backoff.reset();
+                    }
+                    let delay = backoff.next_delay();
+                    let retry_in = format_args!("{}s", delay.as_secs());
+                    match up_for {
+                        Some(d) if d < STABLE_SESSION => tracing::warn!(
+                            %retry_in,
+                            up_secs = d.as_secs(),
+                            "radio lost shortly after connecting; another client may \
+                             be using the node directly (it serves only the newest \
+                             connection), backing off"
+                        ),
+                        Some(_) => tracing::warn!(%retry_in, "radio lost, reconnecting"),
+                        None => tracing::warn!(%retry_in, "radio did not come up, reconnecting"),
+                    }
+                    if self.wait(delay).await {
                         return Ok(());
                     }
                 }
@@ -554,6 +617,7 @@ impl Core {
             "radio configuration cached"
         );
         self.cache = Some(sync.cache);
+        self.up_since.get_or_insert_with(Instant::now);
         self.radio_up_tx.send_replace(true);
     }
 
@@ -1037,6 +1101,20 @@ mod tests {
         assert_eq!(nodes[1].last_heard, 1000);
         assert_eq!(nodes[1].hops_away, Some(2));
         assert_eq!(nodes[2].last_heard, 2000);
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_max_and_resets() {
+        let mut backoff = Backoff::new(Duration::from_secs(30));
+        let delays: Vec<u64> = (0..5).map(|_| backoff.next_delay().as_secs()).collect();
+        assert_eq!(delays, [5, 10, 20, 30, 30]);
+        backoff.reset();
+        assert_eq!(backoff.next_delay().as_secs(), 5);
+        // A ceiling below the minimum wins.
+        assert_eq!(
+            Backoff::new(Duration::from_secs(2)).next_delay().as_secs(),
+            2
+        );
     }
 
     #[test]
