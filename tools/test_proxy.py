@@ -397,6 +397,9 @@ async def test_admin_response_to_requester_only(env: Env):
     )
     await a.expect(is_response_to(0x5005))
     await b.nothing(is_response_to(0x5005))
+    # A query changes nothing: no need to read the config back.
+    await asyncio.sleep(4)
+    assert len(env.radio.want_configs) == 1, env.radio.want_configs
     a.close()
     b.close()
 

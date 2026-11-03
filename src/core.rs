@@ -73,7 +73,8 @@ struct Pending {
     sent_at: Instant,
     /// Text packet to echo to the other clients once the radio queues it.
     echo: Option<pb::MeshPacket>,
-    /// Admin command to the local node: its config must be read again.
+    /// Admin command that changes the local node: its config must be read
+    /// again.
     local_admin: bool,
 }
 
@@ -346,7 +347,8 @@ pub struct Core {
     cache: Option<ConfigCache>,
     history: History,
     sync: Option<Sync>,
-    resync_at: Option<Instant>,
+    /// Pending re-read of the radio's config, and why.
+    resync_at: Option<(Instant, &'static str)>,
     /// When the current radio session got its configuration.
     up_since: Option<Instant>,
 }
@@ -478,7 +480,7 @@ impl Core {
     }
 
     async fn session(&mut self, mut io: RadioIo) -> SessionEnd {
-        self.start_sync(&io);
+        self.start_sync(&io, "connected");
 
         let mut shutdown_rx = self.shutdown_rx.clone();
         let mut tick = tokio::time::interval(TICK);
@@ -520,16 +522,16 @@ impl Core {
                     if let Some(at) = next_periodic
                         && now >= at
                     {
-                        self.resync_at.get_or_insert(now);
+                        self.resync_at.get_or_insert((now, "periodic"));
                         next_periodic = Some(now + resync_every);
                     }
 
-                    if let Some(at) = self.resync_at
+                    if let Some((at, reason)) = self.resync_at
                         && now >= at
                         && self.sync.is_none()
                     {
                         self.resync_at = None;
-                        self.start_sync(&io);
+                        self.start_sync(&io, reason);
                     }
                 }
                 _ = shutdown_rx.wait_for(|stop| *stop) => {
@@ -542,14 +544,14 @@ impl Core {
 
     /// Ask the radio for its configuration and node database. Clients keep
     /// being served the previous copy until the new one is complete.
-    fn start_sync(&mut self, io: &RadioIo) {
+    fn start_sync(&mut self, io: &RadioIo, reason: &str) {
         let nonce = loop {
             let n: u32 = rand::random();
             if n != 0 && n != NONCE_ONLY_CONFIG && n != NONCE_ONLY_NODES {
                 break n;
             }
         };
-        tracing::info!(nonce, "requesting configuration from radio");
+        tracing::info!(nonce, reason, "requesting configuration from radio");
         self.sync = Some(Sync {
             nonce,
             started_at: Instant::now(),
@@ -599,7 +601,7 @@ impl Core {
             Some(V::Rebooted(_)) => {
                 tracing::warn!("radio rebooted, reading its configuration again");
                 self.broadcast(None, &frame);
-                self.start_sync(io);
+                self.start_sync(io, "radio rebooted");
             }
             _ => self.broadcast(None, &frame),
         }
@@ -642,7 +644,7 @@ impl Core {
         {
             let (client_id, local_admin) = (pending.client_id, pending.local_admin);
             if local_admin {
-                self.schedule_resync(ADMIN_RESYNC_DELAY);
+                self.schedule_resync(ADMIN_RESYNC_DELAY, "admin change");
             }
             tracing::debug!(
                 client = %client_id,
@@ -681,7 +683,7 @@ impl Core {
             return;
         }
         if local_admin {
-            self.schedule_resync(ADMIN_RESYNC_DELAY);
+            self.schedule_resync(ADMIN_RESYNC_DELAY, "admin change");
         }
         if let Some(mut p) = echo {
             // What the other clients would see had it come over the air.
@@ -883,7 +885,9 @@ impl Core {
         let (echo, local_admin) = match &p.payload_variant {
             Some(mesh_packet::PayloadVariant::Decoded(data)) => (
                 is_text(data.portnum).then(|| p.clone()),
-                data.portnum == pb::PortNum::AdminApp as i32 && (p.to == 0 || p.to == my_node_num),
+                data.portnum == pb::PortNum::AdminApp as i32
+                    && (p.to == 0 || p.to == my_node_num)
+                    && admin_changes_node(&data.payload),
             ),
             _ => (None, false),
         };
@@ -914,10 +918,10 @@ impl Core {
 
     // --- Helpers ---
 
-    fn schedule_resync(&mut self, delay: Duration) {
+    fn schedule_resync(&mut self, delay: Duration, reason: &'static str) {
         let at = Instant::now() + delay;
-        if self.resync_at.is_none_or(|current| at < current) {
-            self.resync_at = Some(at);
+        if self.resync_at.is_none_or(|(current, _)| at < current) {
+            self.resync_at = Some((at, reason));
         }
     }
 
@@ -935,6 +939,33 @@ impl Core {
             }
         }
     }
+}
+
+/// Whether an admin message may change the node's config or node
+/// database. Apps send bursts of queries when they connect; reading the
+/// whole config back after each of them would be pointless. Anything not
+/// known to be harmless counts as a change.
+fn admin_changes_node(payload: &[u8]) -> bool {
+    use pb::admin_message::PayloadVariant as A;
+    !matches!(
+        pb::AdminMessage::decode(payload).map(|m| m.payload_variant),
+        Ok(Some(
+            A::GetChannelRequest(_)
+                | A::GetOwnerRequest(_)
+                | A::GetConfigRequest(_)
+                | A::GetModuleConfigRequest(_)
+                | A::GetCannedMessageModuleMessagesRequest(_)
+                | A::GetDeviceMetadataRequest(_)
+                | A::GetRingtoneRequest(_)
+                | A::GetDeviceConnectionStatusRequest(_)
+                | A::GetNodeRemoteHardwarePinsRequest(_)
+                | A::GetUiConfigRequest(_)
+                | A::SetTimeOnly(_)
+                | A::SendInputEvent(_)
+                | A::KeyVerification(_)
+                | A::BeginEditSettings(_)
+        ))
+    )
 }
 
 fn portnum_of(p: &pb::MeshPacket) -> i32 {
@@ -1101,6 +1132,27 @@ mod tests {
         assert_eq!(nodes[1].last_heard, 1000);
         assert_eq!(nodes[1].hops_away, Some(2));
         assert_eq!(nodes[2].last_heard, 2000);
+    }
+
+    #[test]
+    fn only_admin_changes_trigger_a_resync() {
+        use pb::admin_message::PayloadVariant as A;
+        let admin = |v| {
+            pb::AdminMessage {
+                payload_variant: Some(v),
+                ..Default::default()
+            }
+            .encode_to_vec()
+        };
+        assert!(!admin_changes_node(&admin(A::GetConfigRequest(0))));
+        assert!(!admin_changes_node(&admin(A::GetChannelRequest(1))));
+        assert!(!admin_changes_node(&admin(A::SetTimeOnly(1_800_000_000))));
+        assert!(admin_changes_node(&admin(A::SetOwner(pb::User::default()))));
+        assert!(admin_changes_node(&admin(A::CommitEditSettings(true))));
+        assert!(admin_changes_node(&admin(A::RemoveByNodenum(2))));
+        // Unknown or unreadable: assume it changes something.
+        assert!(admin_changes_node(&[0xFF, 0xFF]));
+        assert!(admin_changes_node(&[]));
     }
 
     #[test]
