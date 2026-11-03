@@ -44,6 +44,15 @@ pub enum Backend {
     Tcp { host: String, port: u16 },
 }
 
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backend::Serial { path, baud } => write!(f, "serial {path}@{baud}"),
+            Backend::Tcp { host, port } => write!(f, "tcp {host}:{port}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CoreConfig {
     pub backend: Backend,
@@ -107,6 +116,18 @@ impl ConfigCache {
                 }
             }
             _ => self.items.push(Item::Other(frame)),
+        }
+    }
+
+    /// The local node's user (long and short name), if it is known.
+    fn owner(&self) -> Option<pb::User> {
+        let frame = self.nodes.get(&self.my_node_num)?;
+        match pb::FromRadio::decode(frame.as_slice())
+            .ok()?
+            .payload_variant
+        {
+            Some(from_radio::PayloadVariant::NodeInfo(node)) => node.user,
+            _ => None,
         }
     }
 
@@ -401,6 +422,7 @@ impl Core {
                 Err(e) => {
                     let delay = backoff.next_delay();
                     tracing::warn!(
+                        radio = %self.config.backend,
                         error = %e,
                         retry_in = format_args!("{}s", delay.as_secs()),
                         "radio connection failed"
@@ -411,7 +433,7 @@ impl Core {
                     continue;
                 }
             };
-            tracing::info!("radio connected");
+            tracing::info!(radio = %self.config.backend, "radio connected");
 
             let end = self.session(io).await;
             let up_for = self.up_since.take().map(|t| t.elapsed());
@@ -612,8 +634,11 @@ impl Core {
             tracing::debug!(nonce, "stale config_complete_id, ignored");
             return;
         };
+        let owner = sync.cache.owner().unwrap_or_default();
         tracing::info!(
             my_node = format_args!("!{:08x}", sync.cache.my_node_num),
+            name = owner.long_name,
+            short_name = owner.short_name,
             nodes = sync.cache.nodes.len(),
             items = sync.cache.items.len(),
             "radio configuration cached"
