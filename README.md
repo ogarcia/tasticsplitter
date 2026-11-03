@@ -226,10 +226,23 @@ uv run tools/fake_radio.py --port 4403 --inject 10
 
 ## Container
 
+A multi-stage `Containerfile` is included. Built locally, it compiles the
+binary from source:
+
 ```bash
 docker build -t tasticsplitter -f Containerfile .
 docker run --rm tasticsplitter --help
 ```
+
+CI compiles static musl binaries for amd64 and arm64 on native runners
+(with a cargo cache) and injects them with `--build-arg BUILDER=prebuilt`,
+publishing a multi-arch image to `ghcr.io/ogarcia/tasticsplitter`. Base
+image versions live in `versions.env`.
+
+## Releases
+
+Pushing a bare semver tag (`1.2.3`) publishes a GitHub release with static
+binaries for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`.
 
 ## Project status
 
