@@ -24,6 +24,7 @@ from meshtastic.protobuf import (
     mesh_pb2,
     module_config_pb2,
     portnums_pb2,
+    telemetry_pb2,
 )
 
 log = logging.getLogger("fake_radio")
@@ -32,6 +33,13 @@ START1, START2 = 0x94, 0xC3
 BROADCAST = 0xFFFFFFFF
 MY_NODE = 0x11111111
 OTHER_NODES = {0x22222222: "Alice", 0x33333333: "Bob"}
+SPECIAL_NONCES = (69420, 69421)
+HISTORY_PORTS = (
+    portnums_pb2.POSITION_APP,
+    portnums_pb2.NODEINFO_APP,
+    portnums_pb2.TELEMETRY_APP,
+    portnums_pb2.NODE_STATUS_APP,
+)
 
 
 def frame(payload: bytes) -> bytes:
@@ -70,6 +78,27 @@ class FakeRadio:
         self.received: list[mesh_pb2.ToRadio] = []
         self.connections = 0
         self.next_from_id = 1
+        # Last packet per (node, port, telemetry kind), replayed after every
+        # full want_config like firmware 2.8 does. Seeded with old traffic.
+        self.history: dict[tuple, mesh_pb2.MeshPacket] = {}
+        now = int(time.time())
+        position = mesh_pb2.Position(latitude_i=433311401, longitude_i=-84637327)
+        self.record(
+            self.make_packet(
+                0x22222222, BROADCAST, portnums_pb2.POSITION_APP,
+                position.SerializeToString(), rx_time=now - 86400,
+            )
+        )
+        for metrics, age in (
+            (telemetry_pb2.Telemetry(device_metrics=telemetry_pb2.DeviceMetrics(battery_level=80)), 3600),
+            (telemetry_pb2.Telemetry(environment_metrics=telemetry_pb2.EnvironmentMetrics(temperature=21.5)), 7200),
+        ):
+            self.record(
+                self.make_packet(
+                    0x33333333, BROADCAST, portnums_pb2.TELEMETRY_APP,
+                    metrics.SerializeToString(), rx_time=now - age,
+                )
+            )
 
     async def start(self):
         self.server = await asyncio.start_server(self.handle, "127.0.0.1", self.port)
@@ -159,6 +188,9 @@ class FakeRadio:
                 )
             )
         self.send(mesh_pb2.FromRadio(config_complete_id=nonce))
+        if nonce not in SPECIAL_NONCES:
+            for p in sorted(self.history.values(), key=lambda p: p.rx_time):
+                self.send(mesh_pb2.FromRadio(packet=p))
 
     def on_packet(self, p: mesh_pb2.MeshPacket):
         # Channel indexes past 7 don't exist: the radio refuses the packet.
@@ -199,28 +231,50 @@ class FakeRadio:
                     request_id=p.id,
                 )
 
-    def send_packet(self, src, dst, portnum, payload: bytes, channel=0, request_id=0):
-        self.send(
-            mesh_pb2.FromRadio(
-                packet=mesh_pb2.MeshPacket(
-                    to=dst,
-                    channel=channel,
-                    id=random.randint(1, 0xFFFFFFFF),
-                    rx_time=int(time.time()),
-                    hop_start=3,
-                    hop_limit=2,
-                    decoded=mesh_pb2.Data(
-                        portnum=portnum, payload=payload, request_id=request_id
-                    ),
-                    **{"from": src},
-                )
-            )
+    @staticmethod
+    def history_key(p: mesh_pb2.MeshPacket):
+        if p.decoded.portnum not in HISTORY_PORTS:
+            return None
+        kind = None
+        if p.decoded.portnum == portnums_pb2.TELEMETRY_APP:
+            t = telemetry_pb2.Telemetry()
+            t.ParseFromString(p.decoded.payload)
+            kind = t.WhichOneof("variant")
+        return (getattr(p, "from"), p.decoded.portnum, kind)
+
+    def record(self, p: mesh_pb2.MeshPacket):
+        key = self.history_key(p)
+        if key:
+            self.history[key] = p
+
+    @staticmethod
+    def make_packet(src, dst, portnum, payload: bytes, channel=0, request_id=0, rx_time=None):
+        return mesh_pb2.MeshPacket(
+            to=dst,
+            channel=channel,
+            id=random.randint(1, 0xFFFFFFFF),
+            rx_time=rx_time or int(time.time()),
+            hop_start=3,
+            hop_limit=2,
+            decoded=mesh_pb2.Data(portnum=portnum, payload=payload, request_id=request_id),
+            **{"from": src},
         )
+
+    def send_packet(self, src, dst, portnum, payload: bytes, channel=0, request_id=0):
+        p = self.make_packet(src, dst, portnum, payload, channel, request_id)
+        self.record(p)
+        self.send(mesh_pb2.FromRadio(packet=p))
 
     # --- Injection helpers for tests ---
 
     def inject_text(self, text: str, src=0x22222222, dst=BROADCAST, channel=0):
         self.send_packet(src, dst, portnums_pb2.TEXT_MESSAGE_APP, text.encode(), channel)
+
+    def inject_telemetry(self, num: int, battery_level: int):
+        metrics = telemetry_pb2.Telemetry(
+            device_metrics=telemetry_pb2.DeviceMetrics(battery_level=battery_level)
+        )
+        self.send_packet(num, BROADCAST, portnums_pb2.TELEMETRY_APP, metrics.SerializeToString())
 
     def inject_nodeinfo(self, num: int, long_name: str):
         self.send_packet(

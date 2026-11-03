@@ -132,7 +132,8 @@ impl ConfigCache {
 
     /// Fold what a packet tells about its sender into the node database,
     /// as the firmware does, so clients connecting later don't get stale
-    /// last-heard times, positions or names.
+    /// last-heard times, positions or names. Packets older than what the
+    /// node already has (the radio's history replay) are ignored.
     fn update_from_packet(&mut self, p: &pb::MeshPacket) {
         if p.from == 0 {
             return;
@@ -149,6 +150,9 @@ impl ConfigCache {
                 num: p.from,
                 ..Default::default()
             });
+        if p.rx_time != 0 && p.rx_time < node.last_heard {
+            return;
+        }
 
         if p.from != self.my_node_num {
             if p.rx_time != 0 {
@@ -203,6 +207,84 @@ impl ConfigCache {
     }
 }
 
+/// Packet kinds the firmware keeps the last one of, per node, and replays
+/// to a client after every full want_config.
+const HISTORY_PORTS: [pb::PortNum; 4] = [
+    pb::PortNum::PositionApp,
+    pb::PortNum::NodeinfoApp,
+    pb::PortNum::TelemetryApp,
+    pb::PortNum::NodeStatusApp,
+];
+
+/// Sender, port and, for telemetry, which metrics it carries: the firmware
+/// keeps device, environment, power... metrics of a node apart.
+type HistoryKey = (
+    u32,
+    i32,
+    Option<std::mem::Discriminant<pb::telemetry::Variant>>,
+);
+
+struct HistoryEntry {
+    id: u32,
+    rx_time: u32,
+    frame: Vec<u8>,
+}
+
+/// Our copy of the radio's packet history. Seeded by the replay that
+/// follows our own want_config and kept current by live traffic, so each
+/// client gets after its want_config what the radio would have sent it.
+#[derive(Default)]
+struct History {
+    entries: HashMap<HistoryKey, HistoryEntry>,
+}
+
+impl History {
+    fn key(p: &pb::MeshPacket) -> Option<HistoryKey> {
+        let Some(mesh_packet::PayloadVariant::Decoded(data)) = &p.payload_variant else {
+            return None;
+        };
+        let port = pb::PortNum::try_from(data.portnum).ok()?;
+        if p.from == 0 || !HISTORY_PORTS.contains(&port) {
+            return None;
+        }
+        let metrics = (port == pb::PortNum::TelemetryApp)
+            .then(|| pb::Telemetry::decode(data.payload.as_slice()).ok()?.variant)
+            .flatten()
+            .map(|v| std::mem::discriminant(&v));
+        Some((p.from, data.portnum, metrics))
+    }
+
+    /// Record a packet from the radio. Returns false when it is one we
+    /// already hold, or older: the radio replaying its history after one
+    /// of our resyncs, which clients must not get again.
+    fn record(&mut self, p: &pb::MeshPacket, frame: &[u8]) -> bool {
+        let Some(key) = Self::key(p) else {
+            return true;
+        };
+        if let Some(entry) = self.entries.get(&key)
+            && (entry.id == p.id || (p.rx_time != 0 && p.rx_time < entry.rx_time))
+        {
+            return false;
+        }
+        self.entries.insert(
+            key,
+            HistoryEntry {
+                id: p.id,
+                rx_time: p.rx_time,
+                frame: frame.to_vec(),
+            },
+        );
+        true
+    }
+
+    /// The history as the radio sends it, oldest first.
+    fn frames(&self) -> Vec<Vec<u8>> {
+        let mut entries: Vec<&HistoryEntry> = self.entries.values().collect();
+        entries.sort_by_key(|e| e.rx_time);
+        entries.into_iter().map(|e| e.frame.clone()).collect()
+    }
+}
+
 /// A want_config of our own in progress.
 struct Sync {
     nonce: u32,
@@ -224,6 +306,7 @@ pub struct Core {
     clients: HashMap<ClientId, Client>,
     pending: HashMap<u32, Pending>,
     cache: Option<ConfigCache>,
+    history: History,
     sync: Option<Sync>,
     resync_at: Option<Instant>,
 }
@@ -261,6 +344,7 @@ impl Core {
             clients: HashMap::new(),
             pending: HashMap::new(),
             cache: None,
+            history: History::default(),
             sync: None,
             resync_at: None,
         })
@@ -286,6 +370,8 @@ impl Core {
             // forget what was in flight with this radio.
             self.radio_up_tx.send_replace(false);
             self.pending.clear();
+            // The next radio (maybe another one) replays its own.
+            self.history = History::default();
             self.sync = None;
             self.resync_at = None;
 
@@ -472,6 +558,10 @@ impl Core {
     }
 
     async fn handle_radio_packet(&mut self, frame: Vec<u8>, p: &pb::MeshPacket) {
+        if !self.history.record(p, &frame) {
+            tracing::trace!(id = p.id, "history replay of a known packet, dropped");
+            return;
+        }
         if let Some(cache) = &mut self.cache {
             cache.update_from_packet(p);
         }
@@ -664,6 +754,13 @@ impl Core {
         if nonce == NONCE_ONLY_CONFIG {
             // The node database comes next, in a second want_config.
             return;
+        }
+        if nonce != NONCE_ONLY_NODES {
+            let history = self.history.frames();
+            tracing::debug!(client = %client_id, packets = history.len(), "sending packet history");
+            for frame in history {
+                let _ = client.tx.send(frame);
+            }
         }
         client.ready = true;
         let port = client.port;
@@ -940,5 +1037,86 @@ mod tests {
         assert_eq!(nodes[1].last_heard, 1000);
         assert_eq!(nodes[1].hops_away, Some(2));
         assert_eq!(nodes[2].last_heard, 2000);
+    }
+
+    #[test]
+    fn old_packets_do_not_rewind_nodes() {
+        let mut cache = cache();
+        let fresh = pb::MeshPacket {
+            from: 2,
+            rx_time: 5000,
+            ..Default::default()
+        };
+        cache.update_from_packet(&fresh);
+        cache.update_from_packet(&pb::MeshPacket {
+            rx_time: 100,
+            ..fresh
+        });
+        let node = cache
+            .nodes
+            .get(&2)
+            .and_then(|f| pb::FromRadio::decode(f.as_slice()).ok())
+            .and_then(|m| match m.payload_variant {
+                Some(from_radio::PayloadVariant::NodeInfo(n)) => Some(n),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(node.last_heard, 5000);
+    }
+
+    fn telemetry(
+        from: u32,
+        id: u32,
+        rx_time: u32,
+        variant: pb::telemetry::Variant,
+    ) -> pb::MeshPacket {
+        pb::MeshPacket {
+            from,
+            id,
+            rx_time,
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(pb::Data {
+                portnum: pb::PortNum::TelemetryApp as i32,
+                payload: pb::Telemetry {
+                    time: rx_time,
+                    variant: Some(variant),
+                }
+                .encode_to_vec(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn history_keeps_last_per_node_and_metrics() {
+        let device = || pb::telemetry::Variant::DeviceMetrics(pb::DeviceMetrics::default());
+        let env = || pb::telemetry::Variant::EnvironmentMetrics(pb::EnvironmentMetrics::default());
+        let mut history = History::default();
+
+        assert!(history.record(&telemetry(2, 10, 300, device()), b"dev2"));
+        assert!(history.record(&telemetry(2, 11, 100, env()), b"env2"));
+        assert!(history.record(&telemetry(3, 12, 200, device()), b"dev3"));
+        // Newer device metrics of node 2 replace the old ones.
+        assert!(history.record(&telemetry(2, 13, 400, device()), b"dev2b"));
+        // The radio replaying what we hold, or something older: dropped.
+        assert!(!history.record(&telemetry(2, 13, 400, device()), b"dev2b"));
+        assert!(!history.record(&telemetry(2, 10, 300, device()), b"dev2"));
+        // Not a history port: always new.
+        let text = pb::MeshPacket {
+            from: 2,
+            id: 14,
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(pb::Data {
+                portnum: pb::PortNum::TextMessageApp as i32,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(history.record(&text, b"text"));
+        assert!(history.record(&text, b"text"));
+
+        assert_eq!(
+            history.frames(),
+            [b"env2".to_vec(), b"dev3".to_vec(), b"dev2b".to_vec()]
+        );
     }
 }

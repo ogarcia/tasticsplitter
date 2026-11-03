@@ -60,7 +60,17 @@ does the same for MeshCore.
    right after it, except its own. A client never seen before starts
    from that moment. Give each app its own port
    (`--tcp-frontend-port 4403,4404`) so each keeps its own history.
-8. Heartbeats and `disconnect` from clients stay in the proxy, which
+8. Packet history: after every full `want_config` (not 69420 / 69421)
+   firmware 2.8 replays the last position, node info, node status and
+   telemetry (device, environment... apart) it heard from each node, so
+   apps can fill in their node list. The proxy keeps the same history,
+   seeded by that replay and kept current by live traffic, and sends it
+   to each client after its own `want_config`, oldest first, before its
+   missed messages. When the radio replays it again after one of the
+   proxy's re-reads, packets the proxy already holds are not sent to the
+   clients a second time, and old packets never rewind the cached node
+   database.
+9. Heartbeats and `disconnect` from clients stay in the proxy, which
    keeps the radio session alive with its own heartbeats.
 
 The proxy never re-encodes what it relays, so fields added by firmware
@@ -203,6 +213,10 @@ Each test gets a fresh fake radio and proxy on ephemeral ports.
 | `local_admin_triggers_resync` | After `set_owner` the cached config is read again |
 | `admin_response_to_requester_only` | An admin response only reaches the client that asked |
 | `radio_loss_closes_clients` | Losing the radio closes clients and the frontend; it comes back with the radio |
+| `history_after_handshake` | The packet history follows a full `want_config`, oldest first, and not the split ones |
+| `history_does_not_rewind_nodes` | A day-old history packet doesn't turn back a node's last heard |
+| `history_follows_live_traffic` | Newer telemetry replaces the old one in the history; other metrics stay |
+| `resync_replay_not_rebroadcast` | The radio's history replay after a re-read doesn't reach connected clients |
 
 The fake radio also runs standalone:
 
@@ -221,15 +235,14 @@ docker run --rm tasticsplitter --help
 
 Early. Tested against a Heltec V3 with firmware 2.8.2 over TCP, with the
 `meshtastic` CLI (`--info`, `--nodes`, `--traceroute`) alongside other
-clients. Pending: serial backend on real hardware and the official apps.
+clients, and comparing the packet history a client gets through the
+proxy with the radio's own. Pending: serial backend on real hardware and
+the official apps.
 
 Not supported yet:
 
 - **BLE backend**: Meshtastic's BLE API (toRadio / fromRadio / fromNum
   characteristics) differs from the stream API and needs its own
   transport.
-- Replay of anything other than text messages (waypoints, positions...).
-  On connecting, the radio flushes the packets it queued while nobody
-  was attached; those that arrive before any client is ready are only
-  kept if they are text messages.
+- Replay of missed packets other than text messages (waypoints...).
 - XModem file transfers with more than one client doing them at once.

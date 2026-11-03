@@ -17,11 +17,12 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fake_radio import BROADCAST, MY_NODE, FakeRadio, FrameReader, frame  # noqa: E402
-from meshtastic.protobuf import admin_pb2, mesh_pb2, portnums_pb2  # noqa: E402
+from meshtastic.protobuf import admin_pb2, mesh_pb2, portnums_pb2, telemetry_pb2  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("test")
@@ -128,6 +129,39 @@ def is_response_to(packet_id: int):
         m.WhichOneof("payload_variant") == "packet"
         and m.packet.decoded.request_id == packet_id
     )
+
+
+def is_history(m) -> bool:
+    return m.WhichOneof("payload_variant") == "packet" and m.packet.decoded.portnum in (
+        portnums_pb2.POSITION_APP,
+        portnums_pb2.TELEMETRY_APP,
+    )
+
+
+def describe(m) -> str:
+    """'position:<node>' or 'telemetry:<kind>:<node>[:<battery>]' for a packet."""
+    p = m.packet
+    sender = f"{getattr(p, 'from'):08x}"
+    if p.decoded.portnum == portnums_pb2.POSITION_APP:
+        return f"position:{sender}"
+    t = telemetry_pb2.Telemetry()
+    t.ParseFromString(p.decoded.payload)
+    kind = t.WhichOneof("variant")
+    extra = f":{t.device_metrics.battery_level}" if kind == "device_metrics" else ""
+    return f"telemetry:{kind}:{sender}{extra}"
+
+
+async def history_after_handshake(c: Client, nonce=None) -> list[str]:
+    """Handshake, then the packets that follow it right away."""
+    await c.handshake(nonce)
+    got = []
+    try:
+        while True:
+            m = await c.recv(0.5)
+            if is_history(m):
+                got.append(describe(m))
+    except (TimeoutError, asyncio.TimeoutError):
+        return got
 
 
 def node_names(stream) -> dict[int, str]:
@@ -392,6 +426,68 @@ async def test_radio_loss_closes_clients(env: Env):
     b.close()
 
 
+async def test_history_after_handshake(env: Env):
+    c = await env.client(handshake=False)
+    # The radio's own replay, oldest first.
+    assert await history_after_handshake(c) == [
+        "position:22222222",
+        "telemetry:environment_metrics:33333333",
+        "telemetry:device_metrics:33333333:80",
+    ]
+    # Split handshakes get no history, like from the radio.
+    assert await history_after_handshake(c, 69420) == []
+    assert await history_after_handshake(c, 69421) == []
+    c.close()
+
+
+async def test_history_does_not_rewind_nodes(env: Env):
+    c = await env.client(handshake=False)
+    stream = await c.handshake()
+    alice = next(m.node_info for m in stream if m.node_info.num == 0x22222222)
+    # The radio says 10 minutes ago; its day-old position must not win.
+    assert time.time() - alice.last_heard < 3600, alice.last_heard
+    c.close()
+
+
+async def test_history_follows_live_traffic(env: Env):
+    a = await env.client()
+    env.radio.inject_telemetry(0x33333333, 42)
+    await a.expect(lambda m: is_history(m) and describe(m).endswith(":42"))
+    b = await env.client(1, handshake=False)
+    history = await history_after_handshake(b)
+    assert history[-1] == "telemetry:device_metrics:33333333:42", history
+    assert "telemetry:device_metrics:33333333:80" not in history, history
+    assert "telemetry:environment_metrics:33333333" in history, history
+    a.close()
+    b.close()
+
+
+async def test_resync_replay_not_rebroadcast(env: Env):
+    a = await env.client(handshake=False)
+    assert len(await history_after_handshake(a)) == 3
+    admin = admin_pb2.AdminMessage(set_owner=mesh_pb2.User(long_name="Again"))
+    a.send(
+        mesh_pb2.ToRadio(
+            packet=mesh_pb2.MeshPacket(
+                to=MY_NODE,
+                id=0x6006,
+                decoded=mesh_pb2.Data(
+                    portnum=portnums_pb2.ADMIN_APP, payload=admin.SerializeToString()
+                ),
+            )
+        )
+    )
+    for _ in range(50):
+        if len(env.radio.want_configs) >= 2:
+            break
+        await asyncio.sleep(0.2)
+    assert len(env.radio.want_configs) >= 2, env.radio.want_configs
+    await a.nothing(is_history, wait=1.5)
+    env.radio.inject_text("still live")
+    await a.expect(is_text("still live"))
+    a.close()
+
+
 TESTS = [
     test_config_served_from_cache,
     test_special_nonces,
@@ -406,6 +502,10 @@ TESTS = [
     test_local_admin_triggers_resync,
     test_admin_response_to_requester_only,
     test_radio_loss_closes_clients,
+    test_history_after_handshake,
+    test_history_does_not_rewind_nodes,
+    test_history_follows_live_traffic,
+    test_resync_replay_not_rebroadcast,
 ]
 
 
