@@ -1,0 +1,36 @@
+[package]
+name = "tasticsplitter"
+version = "0.1.0"
+authors = ["Óscar García Amor"]
+license = "GPL-3.0"
+readme = "README.md"
+repository = "https://github.com/ogarcia/tasticsplitter"
+documentation = "https://github.com/ogarcia/tasticsplitter"
+homepage = "https://github.com/ogarcia/tasticsplitter"
+description = """
+Meshtastic client multiplexer with cache: fans out a single physical radio
+(serial/TCP) to multiple concurrent client API connections and keeps the
+messages clients missed in SQLite.
+"""
+keywords = ["meshtastic", "lora", "proxy", "multiplexer", "sqlite"]
+include = ["src/", "LICENSE", "README.md"]
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-serial = "5"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+chrono = "0.4"
+rand = "0.9"
+# Only the generated protobufs (prost); no transport, no protoc.
+meshtastic = { version = "0.1.9", default-features = false }
+prost = "0.14"
+
+# Bundle SQLite (no system dep required)
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
