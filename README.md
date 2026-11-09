@@ -254,6 +254,44 @@ CI compiles static musl binaries for amd64 and arm64 on native runners
 publishing a multi-arch image to `ghcr.io/ogarcia/tasticsplitter`. Base
 image versions live in `versions.env`.
 
+### Serial device in a rootless container
+
+To use a radio on USB from rootless Podman, pass the device in and keep
+your supplementary groups. Serial ports are usually `root:uucp` (Arch) or
+`root:dialout` (Debian/Ubuntu) with mode `0660`, and rootless Podman drops
+your groups inside the container by default, so even if your user is in
+that group the proxy gets `failed to open serial port: Permission denied`.
+`--group-add keep-groups` (crun runtime) keeps them.
+
+As a Quadlet user unit (`~/.config/containers/systemd/tasticsplitter.container`):
+
+```ini
+[Unit]
+Description=Meshtastic client multiplexer with cache
+
+[Container]
+Image=ghcr.io/ogarcia/tasticsplitter:master
+# The by-id link survives the port coming back as ttyUSB1
+AddDevice=/dev/serial/by-id/your-device-id:/dev/ttyUSB0
+GroupAdd=keep-groups
+Environment=TASTICSPLITTER_SERIAL_PORT=/dev/ttyUSB0
+PublishPort=4403:4403
+Volume=tasticsplitter.volume:/var/lib/tasticsplitter
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+With plain `podman run`: `--device /dev/ttyUSB0 --group-add keep-groups`.
+
+`ls -l /dev/serial/by-id/` lists your device ids. If the port still
+can't be opened, run the container as root inside (`User=0` and
+`Group=0`, or `--user 0:0`); Docker may need it, since it has no
+`keep-groups`.
+
 ## Releases
 
 Pushing a bare semver tag (`1.2.3`) publishes a GitHub release with static
