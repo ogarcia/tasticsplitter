@@ -423,7 +423,9 @@ impl Core {
                     let delay = backoff.next_delay();
                     tracing::warn!(
                         radio = %self.config.backend,
-                        error = %e,
+                        // Alternate form: the whole cause chain, not just the
+                        // outer context ("failed to open serial port").
+                        error = format_args!("{e:#}"),
                         retry_in = format_args!("{}s", delay.as_secs()),
                         "radio connection failed"
                     );
