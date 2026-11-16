@@ -1,12 +1,34 @@
+<div align="center">
+
+<img src="assets/tasticsplitter-icon.svg" alt="Tastic Splitter" width="128" height="128">
+
 # Tastic Splitter
 
-[Meshtastic](https://meshtastic.org) **client multiplexer with cache**.
-Speaks the client API on both sides: it connects to a physical radio
-(serial or TCP) and serves a TCP interface to multiple concurrent clients
-(the official apps over TCP, the Python CLI, Meshtastic Web through a
-bridge, home automation, bots...). The radio's API only takes one client
-at a time; the proxy keeps that single session and gives every client the
-same view of the radio — it acts as a **faithful mirror**.
+**[Meshtastic](https://meshtastic.org) client multiplexer with cache**
+
+*One radio, many API clients, all seeing the same node.*
+
+[![CI](https://img.shields.io/github/actions/workflow/status/ogarcia/tasticsplitter/ci.yml?branch=master&style=for-the-badge&label=CI&logo=githubactions&logoColor=white)](https://github.com/ogarcia/tasticsplitter/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/license-GPL--3.0-23794a?style=for-the-badge)](LICENSE)
+<br>
+[![Rust](https://img.shields.io/badge/Rust-single%20static%20binary-e66100?style=for-the-badge&logo=rust&logoColor=white)](#build)
+[![SQLite](https://img.shields.io/badge/SQLite-bundled-003b57?style=for-the-badge&logo=sqlite&logoColor=white)](#how-it-works)
+[![Meshtastic client API](https://img.shields.io/badge/Meshtastic-client%20API-67ea94?style=for-the-badge)](https://meshtastic.org/docs/development/device/client-api/)
+[![Radio over TCP · serial](https://img.shields.io/badge/radio-TCP%20%C2%B7%20serial-23794a?style=for-the-badge)](#usage)
+[![Container image](https://img.shields.io/badge/container-ghcr.io-2496ed?style=for-the-badge&logo=docker&logoColor=white)](https://github.com/ogarcia/tasticsplitter/pkgs/container/tasticsplitter)
+
+[How it works](#how-it-works) · [Usage](#usage) · [Container](#container) · [Test suite](#test-suite)
+
+</div>
+
+---
+
+Tastic Splitter speaks the client API on both sides: it connects to a
+physical radio (serial or TCP) and serves a TCP interface to multiple
+concurrent clients (the official apps over TCP, the Python CLI, Meshtastic
+Web through a bridge, home automation, bots...). The radio's API only takes
+one client at a time; the proxy keeps that single session and gives every
+client the same view of the radio — it acts as a **faithful mirror**.
 
 Sibling of [Core Splitter](https://github.com/ogarcia/coresplitter), which
 does the same for MeshCore.
