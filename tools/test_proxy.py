@@ -468,6 +468,10 @@ async def test_history_follows_live_traffic(env: Env):
 async def test_resync_replay_not_rebroadcast(env: Env):
     a = await env.client(handshake=False)
     assert len(await history_after_handshake(a)) == 3
+    # Heard since: the radio replays their old data with a new id and rx_time.
+    for src in (0x22222222, 0x33333333):
+        env.radio.inject_text(f"hi from {src:x}", src=src)
+        await a.expect(is_text(f"hi from {src:x}"))
     admin = admin_pb2.AdminMessage(set_owner=mesh_pb2.User(long_name="Again"))
     a.send(
         mesh_pb2.ToRadio(

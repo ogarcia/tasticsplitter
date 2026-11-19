@@ -246,6 +246,41 @@ const HISTORY_PORTS: [pb::PortNum; 4] = [
     pb::PortNum::NodeStatusApp,
 ];
 
+/// Whether a packet is part of the history replay that follows a want_config.
+/// Firmware 2.8 builds it from its node database, not from stored packets:
+/// rx_time is the node's last_heard and the id a hash of node, last_heard and
+/// kind (makeReplayPacketId in the firmware's PhoneAPI.cpp). So the same data
+/// comes back with a new id and rx_time whenever the node was heard since.
+fn is_firmware_replay(p: &pb::MeshPacket) -> bool {
+    let Some(mesh_packet::PayloadVariant::Decoded(data)) = &p.payload_variant else {
+        return false;
+    };
+    let kind = match pb::PortNum::try_from(data.portnum) {
+        Ok(pb::PortNum::PositionApp | pb::PortNum::NodeStatusApp) => data.portnum as u32,
+        // The Telemetry oneof tag of the metrics carried.
+        Ok(pb::PortNum::TelemetryApp) => match pb::Telemetry::decode(data.payload.as_slice()) {
+            Ok(pb::Telemetry {
+                variant: Some(pb::telemetry::Variant::DeviceMetrics(_)),
+                ..
+            }) => 2,
+            Ok(pb::Telemetry {
+                variant: Some(pb::telemetry::Variant::EnvironmentMetrics(_)),
+                ..
+            }) => 3,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    const K: u32 = 2_654_435_761;
+    let id = p
+        .from
+        .wrapping_mul(K)
+        .wrapping_add(p.rx_time)
+        .wrapping_mul(K)
+        .wrapping_add(kind);
+    p.id == id.max(1)
+}
+
 /// Sender, port and, for telemetry, which metrics it carries: the firmware
 /// keeps device, environment, power... metrics of a node apart.
 type HistoryKey = (
@@ -257,6 +292,9 @@ type HistoryKey = (
 struct HistoryEntry {
     id: u32,
     rx_time: u32,
+    /// Arrival order, for entries with the same rx_time: a replay gives all
+    /// of a node's data its last_heard.
+    seq: u64,
     frame: Vec<u8>,
 }
 
@@ -266,6 +304,7 @@ struct HistoryEntry {
 #[derive(Default)]
 struct History {
     entries: HashMap<HistoryKey, HistoryEntry>,
+    next_seq: u64,
 }
 
 impl History {
@@ -296,11 +335,13 @@ impl History {
         {
             return false;
         }
+        self.next_seq += 1;
         self.entries.insert(
             key,
             HistoryEntry {
                 id: p.id,
                 rx_time: p.rx_time,
+                seq: self.next_seq,
                 frame: frame.to_vec(),
             },
         );
@@ -310,7 +351,7 @@ impl History {
     /// The history as the radio sends it, oldest first.
     fn frames(&self) -> Vec<Vec<u8>> {
         let mut entries: Vec<&HistoryEntry> = self.entries.values().collect();
-        entries.sort_by_key(|e| e.rx_time);
+        entries.sort_by_key(|e| (e.rx_time, e.seq));
         entries.into_iter().map(|e| e.frame.clone()).collect()
     }
 }
@@ -657,6 +698,11 @@ impl Core {
         }
         if let Some(cache) = &mut self.cache {
             cache.update_from_packet(p);
+        }
+        // Clients got the live packet already; a new one gets the history.
+        if is_firmware_replay(p) {
+            tracing::trace!(id = p.id, "history replay with newer data, kept");
+            return;
         }
 
         let data = match &p.payload_variant {
@@ -1275,5 +1321,35 @@ mod tests {
             history.frames(),
             [b"env2".to_vec(), b"dev3".to_vec(), b"dev2b".to_vec()]
         );
+    }
+
+    #[test]
+    fn firmware_replay_recognised_by_its_id() {
+        // Captured from a firmware 2.8.2 replay after a resync.
+        let (node, rx_time) = (0xc9ab_0a0d, 1_795_106_727);
+        let dev = pb::telemetry::Variant::DeviceMetrics(pb::DeviceMetrics::default());
+        let env = pb::telemetry::Variant::EnvironmentMetrics(pb::EnvironmentMetrics::default());
+        let device = telemetry(node, 0xdb88_8466, rx_time, dev.clone());
+        assert!(is_firmware_replay(&device));
+        let environment = telemetry(node, 0xdb88_8467, rx_time, env);
+        assert!(is_firmware_replay(&environment));
+        let position = pb::MeshPacket {
+            from: node,
+            id: 0xdb88_8467,
+            rx_time,
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(pb::Data {
+                portnum: pb::PortNum::PositionApp as i32,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(is_firmware_replay(&position));
+        // Live traffic carries a random id.
+        let live = telemetry(node, 0xdb88_8467, rx_time, dev);
+        assert!(!is_firmware_replay(&live));
+        assert!(!is_firmware_replay(&pb::MeshPacket {
+            id: 0x1234_5678,
+            ..position
+        }));
     }
 }

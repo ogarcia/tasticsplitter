@@ -42,6 +42,13 @@ HISTORY_PORTS = (
 )
 
 
+def replay_id(num: int, timestamp: int, kind: int) -> int:
+    """Id firmware 2.8 gives a replayed packet (makeReplayPacketId)."""
+    h = (num * 2654435761 + timestamp) % 2**32
+    h = (h * 2654435761 + kind) % 2**32
+    return h or 1
+
+
 def frame(payload: bytes) -> bytes:
     return bytes([START1, START2]) + struct.pack(">H", len(payload)) + payload
 
@@ -83,6 +90,8 @@ class FakeRadio:
         # Last packet per (node, port, telemetry kind), replayed after every
         # full want_config like firmware 2.8 does. Seeded with old traffic.
         self.history: dict[tuple, mesh_pb2.MeshPacket] = {}
+        # Last time each node was heard, whatever it sent.
+        self.last_heard: dict[int, int] = {}
         now = int(time.time())
         position = mesh_pb2.Position(latitude_i=433311401, longitude_i=-84637327)
         self.record(
@@ -193,7 +202,27 @@ class FakeRadio:
         self.send(mesh_pb2.FromRadio(config_complete_id=nonce))
         if nonce not in SPECIAL_NONCES:
             for p in sorted(self.history.values(), key=lambda p: p.rx_time):
-                self.send(mesh_pb2.FromRadio(packet=p))
+                self.send(mesh_pb2.FromRadio(packet=self.replayed(p)))
+
+    def replayed(self, p: mesh_pb2.MeshPacket) -> mesh_pb2.MeshPacket:
+        """Firmware 2.8 rebuilds the replay from its node database: positions,
+        telemetry and status carry the node's last_heard as rx_time and an id
+        derived from it, so they change whenever the node was heard since."""
+        port = p.decoded.portnum
+        if port == portnums_pb2.TELEMETRY_APP:
+            t = telemetry_pb2.Telemetry()
+            t.ParseFromString(p.decoded.payload)
+            kind = t.DESCRIPTOR.fields_by_name[t.WhichOneof("variant")].number
+        elif port in (portnums_pb2.POSITION_APP, portnums_pb2.NODE_STATUS_APP):
+            kind = port
+        else:
+            return p
+        src = getattr(p, "from")
+        q = mesh_pb2.MeshPacket()
+        q.CopyFrom(p)
+        q.rx_time = max(p.rx_time, self.last_heard.get(src, 0))
+        q.id = replay_id(src, q.rx_time, kind)
+        return q
 
     def on_packet(self, p: mesh_pb2.MeshPacket):
         # Channel indexes past 7 don't exist: the radio refuses the packet.
@@ -246,6 +275,8 @@ class FakeRadio:
         return (getattr(p, "from"), p.decoded.portnum, kind)
 
     def record(self, p: mesh_pb2.MeshPacket):
+        src = getattr(p, "from")
+        self.last_heard[src] = max(self.last_heard.get(src, 0), p.rx_time)
         key = self.history_key(p)
         if key:
             self.history[key] = p
