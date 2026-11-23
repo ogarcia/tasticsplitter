@@ -495,6 +495,33 @@ async def test_resync_replay_not_rebroadcast(env: Env):
     a.close()
 
 
+async def test_removed_node_leaves_history(env: Env):
+    """A node removed from the radio isn't brought back by our history."""
+    a = await env.client()
+    admin = admin_pb2.AdminMessage(remove_by_nodenum=0x33333333)
+    a.send(
+        mesh_pb2.ToRadio(
+            packet=mesh_pb2.MeshPacket(
+                to=MY_NODE,
+                id=0x7007,
+                decoded=mesh_pb2.Data(
+                    portnum=portnums_pb2.ADMIN_APP, payload=admin.SerializeToString()
+                ),
+            )
+        )
+    )
+    for _ in range(50):
+        if len(env.radio.want_configs) >= 2:
+            break
+        await asyncio.sleep(0.2)
+    assert len(env.radio.want_configs) >= 2, env.radio.want_configs
+    await asyncio.sleep(1)
+    b = await env.client(handshake=False)
+    assert await history_after_handshake(b) == ["position:22222222"]
+    a.close()
+    b.close()
+
+
 async def test_reconnect_backs_off(env: Env):
     """Somebody using the node directly is kicked out less and less often."""
     times = env.radio.connect_times
@@ -539,6 +566,7 @@ TESTS = [
     test_history_does_not_rewind_nodes,
     test_history_follows_live_traffic,
     test_resync_replay_not_rebroadcast,
+    test_removed_node_leaves_history,
     test_reconnect_backs_off,
 ]
 

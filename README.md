@@ -91,7 +91,9 @@ does the same for MeshCore.
    missed messages. When the radio replays it again after one of the
    proxy's re-reads, packets the proxy already holds are not sent to the
    clients a second time, and old packets never rewind the cached node
-   database.
+   database. Nodes gone from the radio's node list after a re-read (a
+   client removed them, or the firmware purged them) leave the history
+   too, so it doesn't bring them back to the apps.
 9. Heartbeats and `disconnect` from clients stay in the proxy, which
    keeps the radio session alive with its own heartbeats.
 
@@ -254,6 +256,7 @@ Each test gets a fresh fake radio and proxy on ephemeral ports.
 | `history_follows_live_traffic` | Newer telemetry replaces the old one in the history; other metrics stay |
 | `reconnect_backs_off` | A client that takes the node over is kicked out after 5 s, then 10 s |
 | `resync_replay_not_rebroadcast` | The radio's history replay after a re-read doesn't reach connected clients |
+| `removed_node_leaves_history` | A node removed from the radio isn't sent in the history any more |
 
 The fake radio also runs standalone:
 

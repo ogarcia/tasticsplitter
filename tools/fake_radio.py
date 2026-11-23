@@ -253,6 +253,11 @@ class FakeRadio:
             which = admin.WhichOneof("payload_variant")
             if which == "set_owner":
                 self.owner = admin.set_owner.long_name
+            elif which == "remove_by_nodenum":
+                num = admin.remove_by_nodenum
+                self.nodes.pop(num, None)
+                self.last_heard.pop(num, None)
+                self.history = {k: v for k, v in self.history.items() if k[0] != num}
             elif which == "get_owner_request" and p.decoded.want_response:
                 reply = admin_pb2.AdminMessage(get_owner_response=user(MY_NODE, self.owner))
                 self.send_packet(

@@ -348,6 +348,14 @@ impl History {
         true
     }
 
+    /// Drop what we hold of nodes the radio no longer has (removed by a
+    /// client or purged by the firmware), as its own replay would. Entries
+    /// newer than `since` came after the node list and are kept.
+    fn retain_nodes(&mut self, nodes: &HashMap<u32, Vec<u8>>, since: u64) {
+        self.entries
+            .retain(|&(from, ..), e| e.seq > since || nodes.contains_key(&from));
+    }
+
     /// The history as the radio sends it, oldest first.
     fn frames(&self) -> Vec<Vec<u8>> {
         let mut entries: Vec<&HistoryEntry> = self.entries.values().collect();
@@ -360,6 +368,8 @@ impl History {
 struct Sync {
     nonce: u32,
     started_at: Instant,
+    /// History entries recorded up to here predate the node list.
+    history_seq: u64,
     cache: ConfigCache,
 }
 
@@ -620,6 +630,7 @@ impl Core {
         self.sync = Some(Sync {
             nonce,
             started_at: Instant::now(),
+            history_seq: self.history.next_seq,
             cache: ConfigCache::default(),
         });
         send_to_radio(io, to_radio::PayloadVariant::WantConfigId(nonce));
@@ -686,6 +697,15 @@ impl Core {
             items = sync.cache.items.len(),
             "radio configuration cached"
         );
+        let before = self.history.entries.len();
+        self.history
+            .retain_nodes(&sync.cache.nodes, sync.history_seq);
+        if self.history.entries.len() < before {
+            tracing::debug!(
+                dropped = before - self.history.entries.len(),
+                "history of nodes gone from the radio dropped"
+            );
+        }
         self.cache = Some(sync.cache);
         self.up_since.get_or_insert_with(Instant::now);
         self.radio_up_tx.send_replace(true);
@@ -1321,6 +1341,22 @@ mod tests {
             history.frames(),
             [b"env2".to_vec(), b"dev3".to_vec(), b"dev2b".to_vec()]
         );
+    }
+
+    #[test]
+    fn history_follows_the_radio_node_list() {
+        let device = || pb::telemetry::Variant::DeviceMetrics(pb::DeviceMetrics::default());
+        let mut history = History::default();
+        history.record(&telemetry(2, 10, 100, device()), b"dev2");
+        history.record(&telemetry(3, 11, 200, device()), b"dev3");
+        let since = history.next_seq;
+        // Node 4 heard while the radio was sending its node list.
+        history.record(&telemetry(4, 12, 300, device()), b"dev4");
+
+        // Node 3 was removed from the radio.
+        let nodes = HashMap::from([(2, Vec::new())]);
+        history.retain_nodes(&nodes, since);
+        assert_eq!(history.frames(), [b"dev2".to_vec(), b"dev4".to_vec()]);
     }
 
     #[test]
